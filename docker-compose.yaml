@@ -1,0 +1,27 @@
+services:  
+  # ===========================
+  # DATABASE
+  # ===========================
+  ln-history-database:
+    image: postgres:18.1
+    container_name: ln-history-database
+    restart: always
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DB: lnhistory
+    volumes:
+      # Persist data to host
+      - ./ln-history-database-data:/var/lib/postgresql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+
+  adminer:
+    image: adminer:5.4.1
+    container_name: adminer
+    restart: always
+    ports:
+      - "8080:8080"
+    depends_on:
+      - ln-history-database
