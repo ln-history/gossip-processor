@@ -4,3 +4,4 @@ pyzmq
 psycopg[binary]
 psycopg_pool
 crc32c
+prometheus-client

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 import zmq
 from psycopg_pool import ConnectionPool
+from prometheus_client import start_http_server, Counter
 
 from lnhistoryclient.parser import parser_factory
 from lnhistoryclient.parser.common import strip_known_message_type, varint_decode
@@ -22,6 +23,9 @@ ZMQ_SOURCES = os.getenv("ZMQ_SOURCES", "tcp://host.docker.internal:5675,tcp://ho
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("processor")
+
+# Define Metrics
+MSG_COUNTER = Counter('gossip_messages_total', 'Total gossip messages', ['type', 'source'])
 
 class Database:
     def __init__(self, conn_str):
@@ -337,6 +341,8 @@ class GossipProcessor:
             collector_node_id = metadata.get('sender_node_id')
             timestamp = metadata.get('timestamp')
             dt = datetime.fromtimestamp(timestamp, timezone.utc)
+
+            MSG_COUNTER.labels(type=msg_type, source=collector_node_id).inc()
             
             # 5. DB Operations
             # We pass 'raw_bytes_full' to insert_content so the DB stores [VarInt + Type + Body]
@@ -389,6 +395,10 @@ class GossipProcessor:
                 logger.error(f"DB Worker Error: {e}")
 
     def start(self):
+        # Start Metrics Server on Port 8000
+        start_http_server(8000)
+        logger.info("📈 Metrics server started on port 8000")
+
         threads = []
         for src in ZMQ_SOURCES:
             t = threading.Thread(target=self.zmq_worker, args=(src,), daemon=True)

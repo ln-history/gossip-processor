@@ -1,4 +1,6 @@
 ln-history-database-data/
+prometheus-data/
+grafana-data/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
