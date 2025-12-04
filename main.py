@@ -17,10 +17,8 @@ from lnhistoryclient.parser.common import strip_known_message_type, varint_decod
 
 # --- CONFIGURATION ---
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-# POSTGRES_URI = os.getenv("POSTGRES_URI")
-POSTGRES_URI = "postgresql://admin:M4DPneUZw3SPYa5jVS2nMxSkmhU4427pEJ42chmN@127.0.0.1:5432/lnhistory"
-# ZMQ_SOURCES = os.getenv("ZMQ_SOURCES", "tcp://host.docker.internal:5675,tcp://host.docker.internal:5676").split(",")
-ZMQ_SOURCES = os.getenv("ZMQ_SOURCES", "tcp://localhost:5675,tcp://localhost:5676").split(",")
+POSTGRES_URI = os.getenv("POSTGRES_URI")
+ZMQ_SOURCES = os.getenv("ZMQ_SOURCES", "tcp://host.docker.internal:5675,tcp://host.docker.internal:5676").split(",")
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("processor")
