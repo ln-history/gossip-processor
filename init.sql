@@ -107,7 +107,7 @@ CREATE TABLE IF NOT EXISTS channels (
 -- Type 258: Channel Update
 CREATE TABLE IF NOT EXISTS channel_updates (
     gossip_id VARCHAR(64) PRIMARY KEY REFERENCES gossip_inventory(gossip_id),
-    scid BIGINT REFERENCES channels(scid), -- BigInt match
+    scid BIGINT, -- BigInt match
     direction BIT,
     
     -- Validity Range (SCD Type 2)

@@ -81,48 +81,71 @@ class Database:
                     self._handle_channel_update(cur, gossip_id, dt, raw_bytes, data)
 
                 return True
-
-    def _handle_node_announcement(self, cur, gossip_id, dt, raw_bytes, data):
-        node_id = data['node_id']
+            
+    def insert_node_addresses(self, cur, gossip_id, addresses):
+        """
+        Parses the list of address dicts from lnhistoryclient and inserts them.
         
-        # Ensure public node exists
-        cur.execute("""
-            INSERT INTO nodes (node_id, first_seen, last_seen)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (node_id) DO UPDATE SET last_seen = EXCLUDED.last_seen
-        """, (node_id, dt, dt))
+        Input format from your library:
+        [
+            {
+                "typ": {"id": 1, "name": "IPv4"}, 
+                "addr": "1.2.3.4", 
+                "port": 9735
+            }, ...
+        ]
+        """
+        if not addresses:
+            return
 
-        # SCD Type 2: Close previous
-        cur.execute("""
-            UPDATE node_announcements SET valid_to = %s 
-            WHERE node_id = %s AND valid_to IS NULL
-        """, (dt, node_id))
+        for addr_dict in addresses:
+            # 1. Extract Nested Type ID
+            # Your library returns a dict for 'typ', we need the 'id' inside it.
+            type_obj = addr_dict.get('typ')
+            type_id = None
+            
+            if isinstance(type_obj, dict):
+                type_id = type_obj.get('id')
+            elif isinstance(type_obj, int):
+                # Fallback just in case raw int is passed
+                type_id = type_obj
+            
+            address_str = addr_dict.get('addr')
+            port = addr_dict.get('port')
 
-        # Insert new
-        cur.execute("""
-            INSERT INTO node_announcements 
-            (gossip_id, node_id, valid_from, signature, features, rgb_color, alias, raw_gossip)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """, (
-            gossip_id, node_id, dt,
-            data['signature'],
-            bytes.fromhex(data['features']),
-            data['rgb_color'],
-            data['alias'],
-            raw_bytes
-        ))
+            # Only insert if we have valid data
+            if type_id is not None and address_str:
+                cur.execute("""
+                    INSERT INTO node_addresses (gossip_id, type_id, address, port)
+                    VALUES (%s, %s, %s, %s)
+                """, (gossip_id, type_id, address_str, port))
 
     def _handle_channel_announcement(self, cur, gossip_id, dt, raw_bytes, data):
-        # Your library likely returns scid as a string or parsed object
-        # We need to convert it to int for our DB optimization
-        # Assuming your lib might return "800000x12x1" or similar
-        scid_str = data.get('scid')
+        """
+        Handles Channel Announcement (Type 256).
+        Edge Case: Nodes 1 & 2 might not exist yet. We must create placeholder entries for them.
+        """
+        # 1. Parse SCID to Integer (Critical for DB performance)
+        scid_str = data.get('scid') 
         scid_int = self._parse_scid_to_int(scid_str)
         
-        # Ensure both nodes exist
-        for nid in [data['node_id_1'], data['node_id_2']]:
-            cur.execute("INSERT INTO nodes (node_id, first_seen, last_seen) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING", (nid, dt, dt))
+        node1 = data.get('node_id_1')
+        node2 = data.get('node_id_2')
 
+        # 2. EDGE CASE: Ensure both nodes exist in the 'nodes' table.
+        # We use ON CONFLICT DO NOTHING because we only want to ensure the ID exists.
+        # We do NOT insert into 'node_announcements' (raw_gossip) because we haven't seen their metadata yet.
+        # This effectively creates a "Ghost Node" or "Stub" that satisfies the Foreign Key.
+        for nid in [node1, node2]:
+            if nid:
+                cur.execute("""
+                    INSERT INTO nodes (node_id, first_seen, last_seen) 
+                    VALUES (%s, %s, %s) 
+                    ON CONFLICT (node_id) DO UPDATE 
+                    SET last_seen = GREATEST(nodes.last_seen, EXCLUDED.last_seen)
+                """, (nid, dt, dt))
+
+        # 3. Insert the Channel
         cur.execute("""
             INSERT INTO channels 
             (gossip_id, scid, source_node_id, target_node_id, 
@@ -132,29 +155,86 @@ class Database:
             ON CONFLICT (scid) DO NOTHING
         """, (
             gossip_id, scid_int,
-            data['node_id_1'], data['node_id_2'],
-            data['node_signature_1'], data['node_signature_2'],
-            data['bitcoin_signature_1'], data['bitcoin_signature_2'],
-            bytes.fromhex(data['features']),
-            data['chain_hash'],
-            data['bitcoin_key_1'], data['bitcoin_key_2'],
+            node1, node2,
+            data.get('node_signature_1'), data.get('node_signature_2'),
+            data.get('bitcoin_signature_1'), data.get('bitcoin_signature_2'),
+            bytes.fromhex(data.get('features', '')) if data.get('features') else None,
+            data.get('chain_hash'),
+            data.get('bitcoin_key_1'), data.get('bitcoin_key_2'),
             raw_bytes
         ))
 
+    def _handle_node_announcement(self, cur, gossip_id, dt, raw_bytes, data):
+        """
+        Handles Node Announcement (Type 257).
+        Update logic: Closes previous validity ranges (SCD Type 2).
+        """
+        node_id = data.get('node_id')
+        
+        if not node_id:
+            logger.warning(f"Node Announcement missing node_id. Gossip ID: {gossip_id}")
+            return
+
+        # 1. Ensure public node exists (or update 'last_seen' if it was just a stub from a channel)
+        cur.execute("""
+            INSERT INTO nodes (node_id, first_seen, last_seen)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (node_id) DO UPDATE SET last_seen = EXCLUDED.last_seen
+        """, (node_id, dt, dt))
+
+        # 2. SCD Type 2 Logic: "Retire" the previous active record
+        # We find the record for this node that is currently open (valid_to IS NULL) and close it.
+        cur.execute("""
+            UPDATE node_announcements SET valid_to = %s 
+            WHERE node_id = %s AND valid_to IS NULL
+        """, (dt, node_id))
+
+        # 3. Insert the new active record
+        cur.execute("""
+            INSERT INTO node_announcements 
+            (gossip_id, node_id, valid_from, signature, features, rgb_color, alias, raw_gossip)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            gossip_id, node_id, dt,
+            data.get('signature'),
+            bytes.fromhex(data.get('features', '')) if data.get('features') else None,
+            data.get('rgb_color'),
+            data.get('alias'),
+            raw_bytes
+        ))
+        
+        # 4. Handle Addresses (Normalized Table)
+        # We call the helper to insert into 'node_addresses' linking to THIS gossip_id
+        self.insert_node_addresses(cur, gossip_id, data.get('addresses', []))
+
     def _handle_channel_update(self, cur, gossip_id, dt, raw_bytes, data):
+        """
+        Handles Channel Update (Type 258).
+        Edge Case: Orphan Updates (Channel doesn't exist yet).
+        """
         scid_str = data.get('scid')
         scid_int = self._parse_scid_to_int(scid_str)
         
-        # Channel flags: bit 0 indicates direction (0=Node1, 1=Node2)
+        # Channel flags bit 0: 0 = Node1, 1 = Node2
         flags = int(data.get('channel_flags', 0))
         direction = flags & 1
         
-        # SCD Type 2
+        # 1. ORPHAN CHECK
+        # We check if the channel exists. If not, we log a warning but still insert 
+        # because you explicitly removed the FK constraint on 'scid' in your schema.
+        cur.execute("SELECT 1 FROM channels WHERE scid = %s", (scid_int,))
+        if cur.fetchone() is None:
+            # Log it so you can track how often this happens via Grafana (logs panel)
+            logger.warning(f"Orphan Update: SCID {scid_int} not found in channels table. Storing anyway.")
+
+        # 2. SCD Type 2 Logic: Close previous update for THIS direction
+        # A channel has two updates (one from each side). We only close the one matching our direction.
         cur.execute("""
             UPDATE channel_updates SET valid_to = %s 
             WHERE scid = %s AND direction = %s::bit AND valid_to IS NULL
         """, (dt, scid_int, str(direction)))
 
+        # 3. Insert new update
         cur.execute("""
             INSERT INTO channel_updates 
             (gossip_id, scid, direction, valid_from,
@@ -164,11 +244,11 @@ class Database:
             VALUES (%s, %s, %s::bit, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             gossip_id, scid_int, str(direction), dt,
-            data['signature'], data['chain_hash'],
-            data['message_flags'], data['channel_flags'],
-            data['cltv_expiry_delta'], data['htlc_minimum_msat'],
-            data['fee_base_msat'], data['fee_proportional_millionths'],
-            data['htlc_maximum_msat'],
+            data.get('signature'), data.get('chain_hash'),
+            data.get('message_flags'), data.get('channel_flags'),
+            data.get('cltv_expiry_delta'), data.get('htlc_minimum_msat'),
+            data.get('fee_base_msat'), data.get('fee_proportional_millionths'),
+            data.get('htlc_maximum_msat'),
             raw_bytes
         ))
 
