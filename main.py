@@ -13,12 +13,14 @@ import zmq
 from psycopg_pool import ConnectionPool
 
 from lnhistoryclient.parser import parser_factory
-from lnhistoryclient.parser.common import strip_known_message_type
+from lnhistoryclient.parser.common import strip_known_message_type, varint_decode
 
 # --- CONFIGURATION ---
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-POSTGRES_URI = os.getenv("POSTGRES_URI")
-ZMQ_SOURCES = os.getenv("ZMQ_SOURCES", "tcp://host.docker.internal:5675,tcp://host.docker.internal:5676").split(",")
+# POSTGRES_URI = os.getenv("POSTGRES_URI")
+POSTGRES_URI = "postgresql://admin:M4DPneUZw3SPYa5jVS2nMxSkmhU4427pEJ42chmN@127.0.0.1:5432/lnhistory"
+# ZMQ_SOURCES = os.getenv("ZMQ_SOURCES", "tcp://host.docker.internal:5675,tcp://host.docker.internal:5676").split(",")
+ZMQ_SOURCES = os.getenv("ZMQ_SOURCES", "tcp://localhost:5675,tcp://localhost:5676").split(",")
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("processor")
@@ -116,7 +118,7 @@ class Database:
         # Your library likely returns scid as a string or parsed object
         # We need to convert it to int for our DB optimization
         # Assuming your lib might return "800000x12x1" or similar
-        scid_str = data.get('short_channel_id')
+        scid_str = data.get('scid')
         scid_int = self._parse_scid_to_int(scid_str)
         
         # Ensure both nodes exist
@@ -142,11 +144,10 @@ class Database:
         ))
 
     def _handle_channel_update(self, cur, gossip_id, dt, raw_bytes, data):
-        scid_str = data.get('short_channel_id')
+        scid_str = data.get('scid')
         scid_int = self._parse_scid_to_int(scid_str)
         
         # Channel flags: bit 0 indicates direction (0=Node1, 1=Node2)
-        # Your library might expose this, or we parse it from 'channel_flags'
         flags = int(data.get('channel_flags', 0))
         direction = flags & 1
         
@@ -190,6 +191,32 @@ class GossipProcessor:
         self.queue = Queue()
         self.processed_count = 0
 
+    def _strip_varint_len(self, data: bytes) -> bytes:
+        """
+        Detects and strips the Bitcoin-style VarInt length prefix.
+        Returns the remaining data (which starts with the 2-byte msg type).
+        """
+        if len(data) < 1:
+            return data
+            
+        first = data[0]
+        
+        # Determine VarInt size based on the first byte prefix
+        if first < 0xfd:
+            # 1 byte VarInt (values < 0xfd)
+            return data[1:]
+        elif first == 0xfd:
+            # 3 bytes total (prefix + uint16)
+            return data[3:]
+        elif first == 0xfe:
+            # 5 bytes total (prefix + uint32)
+            return data[5:]
+        elif first == 0xff:
+            # 9 bytes total (prefix + uint64)
+            return data[9:]
+        
+        return data
+
     def calculate_gossip_id(self, raw_bytes: bytes) -> str:
         return hashlib.sha256(raw_bytes).hexdigest()
 
@@ -202,36 +229,43 @@ class GossipProcessor:
                 return
 
             # 1. Decode Hex to Bytes
-            raw_bytes = bytes.fromhex(raw_hex)
+            # This contains the full sequence: [VarInt Length] + [Type] + [Body]
+            raw_bytes_full = bytes.fromhex(raw_hex)
             
-            # 2. Parse using lnhistoryclient
+            # 2. Calculate ID from the FULL RAW MESSAGE
+            # We hash exactly what we received and what we will store.
+            gossip_id = self.calculate_gossip_id(raw_bytes_full)
+
+            # 3. Prepare data for the Parser (Needs [Body] only)
+            # First, strip the VarInt to get [Type + Body]
+            raw_payload_with_type = self._strip_varint_len(raw_bytes_full)
+            
+            # Second, strip the 2-byte Type to get [Body]
+            # This is what lnhistoryclient expects
+            payload_body_only = strip_known_message_type(raw_payload_with_type)
+            
+            # 4. Parse using lnhistoryclient
             msg_type = metadata.get('type')
+            parsed_obj = None
             
             try:
-                # Get the correct parser function (e.g., parse_channel_announcement)
                 parser_func = parser_factory.get_parser_by_message_type(msg_type)
-                
-                payload_only =  strip_known_message_type(raw_bytes)
-                
-                parsed_obj = parser_func(payload_only)
-                
+                parsed_obj = parser_func(payload_body_only)
             except Exception as e:
+                # If parsing fails, we log it but proceed to store the raw blob
                 logger.warning(f"Failed to parse message type {msg_type}: {e}")
-                # We skip detailed parsing but still allow raw insertion below if needed
-                # (though in this architecture, we usually return here)
                 return
-
+            
             collector_node_id = metadata.get('sender_node_id')
             timestamp = metadata.get('timestamp')
             dt = datetime.fromtimestamp(timestamp, timezone.utc)
             
-            # Calculate ID from raw bytes (canonical)
-            gossip_id = self.calculate_gossip_id(raw_bytes)
-
-            # 3. DB Operations
+            # 5. DB Operations
+            # We pass 'raw_bytes_full' to insert_content so the DB stores [VarInt + Type + Body]
             self.db.register_collector(collector_node_id, dt)
             
-            is_new = self.db.insert_content(gossip_id, msg_type, raw_bytes, parsed_obj, timestamp)
+            is_new = self.db.insert_content(gossip_id, msg_type, raw_bytes_full, parsed_obj, timestamp)
+            
             self.db.insert_observation(gossip_id, collector_node_id, dt)
 
             if is_new:
@@ -240,7 +274,8 @@ class GossipProcessor:
                     logger.info(f"Processed {self.processed_count} new messages. Last type: {msg_type}")
             
         except Exception as e:
-            logger.error(f"Processing Error: {e}")
+            logger.error(f"Processing Error: {e}", exc_info=True)
+
 
     def zmq_worker(self, zmq_uri):
         ctx = zmq.Context()
