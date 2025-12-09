@@ -162,37 +162,54 @@ class Database:
         ))
 
     def _handle_node_announcement(self, cur, gossip_id, dt, raw_bytes, data):
-        """
-        Handles Node Announcement (Type 257).
-        Update logic: Closes previous validity ranges (SCD Type 2).
-        """
         node_id = data.get('node_id')
-        
-        if not node_id:
-            logger.warning(f"Node Announcement missing node_id. Gossip ID: {gossip_id}")
-            return
+        if not node_id: return
 
-        # 1. Ensure public node exists (or update 'last_seen' if it was just a stub from a channel)
+        # 1. Ensure public node stub exists
         cur.execute("""
             INSERT INTO nodes (node_id, first_seen, last_seen)
             VALUES (%s, %s, %s)
             ON CONFLICT (node_id) DO UPDATE SET last_seen = EXCLUDED.last_seen
         """, (node_id, dt, dt))
 
-        # 2. SCD Type 2 Logic: "Retire" the previous active record
-        # We find the record for this node that is currently open (valid_to IS NULL) and close it.
+        # 2. SCD Logic: Try to close the PREVIOUS active record
+        # Added 'AND valid_from < %s' to prevent the "Range Error" crash.
+        # We only close the active record if we are actually newer than it.
         cur.execute("""
             UPDATE node_announcements SET valid_to = %s 
-            WHERE node_id = %s AND valid_to IS NULL
-        """, (dt, node_id))
+            WHERE node_id = %s AND valid_to IS NULL AND valid_from < %s
+        """, (dt, node_id, dt))
+        
+        # Determine valid_to for the NEW record
+        if cur.rowcount > 0:
+            # We successfully closed the old tip. We are now the new tip.
+            valid_to = None
+        else:
+            # We failed to update. Either:
+            # A) No previous record exists (First time seeing node) -> valid_to = None
+            # B) We are OLDER than the current tip (Out-of-order) -> valid_to = tip.valid_from
+            
+            cur.execute("SELECT valid_from FROM node_announcements WHERE node_id = %s AND valid_to IS NULL", (node_id,))
+            current_tip = cur.fetchone()
+            
+            if current_tip:
+                # Case B: We are history. Fill the gap before the current tip starts.
+                valid_to = current_tip[0]
+                
+                # Edge case: If we are effectively simultaneous or older than existing history
+                if dt >= valid_to:
+                    return # Skip this message to avoid unique constraint violations or zero-length ranges
+            else:
+                # Case A: Brand new node
+                valid_to = None
 
-        # 3. Insert the new active record
+        # 3. Insert the record with the calculated valid_to
         cur.execute("""
             INSERT INTO node_announcements 
-            (gossip_id, node_id, valid_from, signature, features, rgb_color, alias, raw_gossip)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            (gossip_id, node_id, valid_from, valid_to, signature, features, rgb_color, alias, raw_gossip)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
-            gossip_id, node_id, dt,
+            gossip_id, node_id, dt, valid_to,
             data.get('signature'),
             bytes.fromhex(data.get('features', '')) if data.get('features') else None,
             data.get('rgb_color'),
@@ -200,46 +217,53 @@ class Database:
             raw_bytes
         ))
         
-        # 4. Handle Addresses (Normalized Table)
-        # We call the helper to insert into 'node_addresses' linking to THIS gossip_id
         self.insert_node_addresses(cur, gossip_id, data.get('addresses', []))
 
     def _handle_channel_update(self, cur, gossip_id, dt, raw_bytes, data):
-        """
-        Handles Channel Update (Type 258).
-        Edge Case: Orphan Updates (Channel doesn't exist yet).
-        """
         scid_str = data.get('scid')
         scid_int = self._parse_scid_to_int(scid_str)
-        
-        # Channel flags bit 0: 0 = Node1, 1 = Node2
         flags = int(data.get('channel_flags', 0))
         direction = flags & 1
         
-        # 1. ORPHAN CHECK
-        # We check if the channel exists. If not, we log a warning but still insert 
+        # 1. Orphan Check (This is just a warning, not an error)
         cur.execute("SELECT 1 FROM channels WHERE scid = %s", (scid_int,))
         if cur.fetchone() is None:
-            # Log it so you can track how often this happens via Grafana (logs panel)
-            logger.warning(f"Orphan Update: SCID {scid_int} not found in channels table. Storing anyway.")
+            logger.warning(f"Orphan Update: SCID {scid_int} not found. Storing anyway.")
 
-        # 2. SCD Type 2 Logic: Close previous update for THIS direction
-        # We only close the update one matching our direction.
+        # 2. SCD Logic: Try to close previous update
+        # Added 'AND valid_from < %s'
         cur.execute("""
             UPDATE channel_updates SET valid_to = %s 
-            WHERE scid = %s AND direction = %s::bit AND valid_to IS NULL
-        """, (dt, scid_int, str(direction)))
+            WHERE scid = %s AND direction = %s::bit AND valid_to IS NULL AND valid_from < %s
+        """, (dt, scid_int, str(direction), dt))
 
-        # 3. Insert new update
+        if cur.rowcount > 0:
+            valid_to = None
+        else:
+            # Out-of-order handling
+            cur.execute("""
+                SELECT valid_from FROM channel_updates 
+                WHERE scid = %s AND direction = %s::bit AND valid_to IS NULL
+            """, (scid_int, str(direction)))
+            current_tip = cur.fetchone()
+            
+            if current_tip:
+                valid_to = current_tip[0]
+                if dt >= valid_to:
+                    return # Skip invalid range
+            else:
+                valid_to = None
+
+        # 3. Insert
         cur.execute("""
             INSERT INTO channel_updates 
-            (gossip_id, scid, direction, valid_from,
+            (gossip_id, scid, direction, valid_from, valid_to,
              signature, chain_hash, message_flags, channel_flags,
              cltv_expiry_delta, htlc_minimum_msat, fee_base_msat, 
              fee_proportional_millionths, htlc_maximum_msat, raw_gossip)
-            VALUES (%s, %s, %s::bit, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s::bit, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
-            gossip_id, scid_int, str(direction), dt,
+            gossip_id, scid_int, str(direction), dt, valid_to,
             data.get('signature'), data.get('chain_hash'),
             data.get('message_flags'), data.get('channel_flags'),
             data.get('cltv_expiry_delta'), data.get('htlc_minimum_msat'),
