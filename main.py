@@ -14,7 +14,10 @@ from psycopg_pool import ConnectionPool
 from prometheus_client import start_http_server, Counter
 
 from lnhistoryclient.parser import parser_factory
-from lnhistoryclient.parser.common import strip_known_message_type, varint_decode
+from lnhistoryclient.parser.common import strip_known_message_type
+from lnhistoryclient.model.ChannelUpdate import ChannelUpdate
+from lnhistoryclient.model.NodeAnnouncement import NodeAnnouncement
+from lnhistoryclient.model.ChannelAnnouncement import ChannelAnnouncement
 
 # --- CONFIGURATION ---
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -89,22 +92,12 @@ class Database:
     def insert_node_addresses(self, cur, gossip_id, addresses):
         """
         Parses the list of address dicts from lnhistoryclient and inserts them.
-        
-        Input format from your library:
-        [
-            {
-                "typ": {"id": 1, "name": "IPv4"}, 
-                "addr": "1.2.3.4", 
-                "port": 9735
-            }, ...
-        ]
         """
         if not addresses:
             return
 
         for addr_dict in addresses:
             # 1. Extract Nested Type ID
-            # Your library returns a dict for 'typ', we need the 'id' inside it.
             type_obj = addr_dict.get('typ')
             type_id = None
             
@@ -225,14 +218,13 @@ class Database:
         
         # 1. ORPHAN CHECK
         # We check if the channel exists. If not, we log a warning but still insert 
-        # because you explicitly removed the FK constraint on 'scid' in your schema.
         cur.execute("SELECT 1 FROM channels WHERE scid = %s", (scid_int,))
         if cur.fetchone() is None:
             # Log it so you can track how often this happens via Grafana (logs panel)
             logger.warning(f"Orphan Update: SCID {scid_int} not found in channels table. Storing anyway.")
 
         # 2. SCD Type 2 Logic: Close previous update for THIS direction
-        # A channel has two updates (one from each side). We only close the one matching our direction.
+        # We only close the update one matching our direction.
         cur.execute("""
             UPDATE channel_updates SET valid_to = %s 
             WHERE scid = %s AND direction = %s::bit AND valid_to IS NULL
@@ -311,51 +303,75 @@ class GossipProcessor:
                 return
 
             # 1. Decode Hex to Bytes
-            # This contains the full sequence: [VarInt Length] + [Type] + [Body]
             raw_bytes_full = bytes.fromhex(raw_hex)
             
             # 2. Calculate ID from the FULL RAW MESSAGE
-            # We hash exactly what we received and what we will store.
             gossip_id = self.calculate_gossip_id(raw_bytes_full)
 
-            # 3. Prepare data for the Parser (Needs [Body] only)
-            # First, strip the VarInt to get [Type + Body]
+            # 3. Prepare data for the Parser
             raw_payload_with_type = self._strip_varint_len(raw_bytes_full)
-            
-            # Second, strip the 2-byte Type to get [Body]
-            # This is what lnhistoryclient expects
             payload_body_only = strip_known_message_type(raw_payload_with_type)
             
             # 4. Parse using lnhistoryclient
             msg_type = metadata.get('type')
             parsed_obj = None
+            parsed_obj: ChannelUpdate | ChannelAnnouncement | NodeAnnouncement
             
             try:
                 parser_func = parser_factory.get_parser_by_message_type(msg_type)
                 parsed_obj = parser_func(payload_body_only)
             except Exception as e:
-                # If parsing fails, we log it but proceed to store the raw blob
                 logger.warning(f"Failed to parse message type {msg_type}: {e}")
                 return
-            
+
             collector_node_id = metadata.get('sender_node_id')
-            timestamp = metadata.get('timestamp')
-            dt = datetime.fromtimestamp(timestamp, timezone.utc)
+            
+            # Use the timestamp from the MESSAGE payload if available (more accurate for "Gossip Time")
+            # Fallback to metadata timestamp (Receipt Time)
+            gossip_ts = metadata.get('timestamp')
+            
+            # Try to extract actual gossip timestamp from parsed object for better logging
+            if hasattr(parsed_obj, 'timestamp'):
+                gossip_ts = parsed_obj.timestamp
+            
+            dt = datetime.fromtimestamp(gossip_ts, timezone.utc)
+            
+            # Calculate Lag (How old is this message?)
+            now = datetime.now(timezone.utc)
+            lag_seconds = (now - dt).total_seconds()
 
             MSG_COUNTER.labels(type=msg_type, source=collector_node_id).inc()
             
             # 5. DB Operations
-            # We pass 'raw_bytes_full' to insert_content so the DB stores [VarInt + Type + Body]
-            self.db.register_collector(collector_node_id, dt)
+            # Note: We register collector using 'now' (receipt time) to track aliveness, 
+            # but we store content using 'dt' (gossip time).
+            receipt_dt = datetime.fromtimestamp(metadata.get('timestamp'), timezone.utc)
             
-            is_new = self.db.insert_content(gossip_id, msg_type, raw_bytes_full, parsed_obj, timestamp)
+            self.db.register_collector(collector_node_id, receipt_dt)
             
-            self.db.insert_observation(gossip_id, collector_node_id, dt)
+            # Insert Content
+            is_new = self.db.insert_content(gossip_id, msg_type, raw_bytes_full, parsed_obj, gossip_ts)
+            
+            # Log Observation
+            self.db.insert_observation(gossip_id, collector_node_id, receipt_dt)
 
             if is_new:
                 self.processed_count += 1
-                if self.processed_count % 50 == 0:
-                    logger.info(f"Processed {self.processed_count} new messages. Last type: {msg_type}")
+                
+                # ENHANCED LOGGING
+                # Log detailed info every 50 messages OR if lag is > 1 hour (catching up)
+                if self.processed_count % 50 == 0 or lag_seconds > 3600:
+                    type_name = "Unknown"
+                    if msg_type == 256: type_name = "channel_announcement"
+                    elif msg_type == 257: type_name = "node_announcement"
+                    elif msg_type == 258: type_name = "channel_update"
+                    
+                    logger.info(
+                        f"Processed {self.processed_count} | "
+                        f"Type: {type_name} ({msg_type}) | "
+                        f"Time: {dt.strftime('%H:%M:%S')} (Lag: {lag_seconds:.0f}s) | "
+                        f"Source: {collector_node_id[:8]}..."
+                    )
             
         except Exception as e:
             logger.error(f"Processing Error: {e}", exc_info=True)
@@ -397,7 +413,7 @@ class GossipProcessor:
     def start(self):
         # Start Metrics Server on Port 8000
         start_http_server(8000)
-        logger.info("📈 Metrics server started on port 8000")
+        logger.info("--- Metrics server started on port 8000 ---")
 
         threads = []
         for src in ZMQ_SOURCES:

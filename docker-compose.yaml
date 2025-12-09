@@ -1,4 +1,20 @@
 services:  
+
+  insert-gossip:
+    build: ./insert-gossip
+    container_name: insert-gossip
+    # This allows you to run it manually: docker compose run insert-gossip
+    # It will exit when done.
+    profiles: ["tools"] # Don't start with normal 'up'
+    environment:
+      POSTGRES_URI: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@ln-history-database:5432/lnhistory
+      # Map the internal path to where you mount the file
+      GOSSIP_FILE_PATH: /data/gossip_store
+    volumes:
+      # MOUNT HUGE FILE HERE
+      - ./import-data/gossip_store:/data/gossip_store
+    depends_on:
+      - ln-history-database
   # ===========================
   # DATABASE
   # ===========================
