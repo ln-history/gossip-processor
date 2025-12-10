@@ -23,10 +23,8 @@ from lnhistoryclient.model.ChannelAnnouncement import ChannelAnnouncement, Chann
 
 # --- CONFIGURATION ---
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-# POSTGRES_URI = os.getenv("POSTGRES_URI")
-POSTGRES_URI = "postgresql://admin:zDEaKsvyshZd3TSPWbmt774duMhqQuHXQpgvcWN9@localhost:5432/lnhistory"
-# ZMQ_SOURCES = os.getenv("ZMQ_SOURCES", "tcp://host.docker.internal:5675,tcp://host.docker.internal:5676").split(",")
-ZMQ_SOURCES = "tcp://localhost:5675,tcp://localhost:5676".split(",")
+POSTGRES_URI = os.getenv("POSTGRES_URI")
+ZMQ_SOURCES = os.getenv("ZMQ_SOURCES", "tcp://host.docker.internal:5675,tcp://host.docker.internal:5676").split(",")
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("gossip-processor")
