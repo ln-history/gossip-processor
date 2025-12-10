@@ -6,18 +6,20 @@ import threading
 import time
 import signal
 import sys
+import codecs
 from queue import Queue, Empty
 from datetime import datetime, timezone
+from typing import List, TypedDict, cast
 
 import zmq
 from psycopg_pool import ConnectionPool
-from prometheus_client import start_http_server, Counter
+from prometheus_client import start_http_server, Counter, Gauge, Histogram
 
 from lnhistoryclient.parser import parser_factory
 from lnhistoryclient.parser.common import strip_known_message_type
-from lnhistoryclient.model.ChannelUpdate import ChannelUpdate
-from lnhistoryclient.model.NodeAnnouncement import NodeAnnouncement
-from lnhistoryclient.model.ChannelAnnouncement import ChannelAnnouncement
+from lnhistoryclient.model.ChannelUpdate import ChannelUpdate, ChannelUpdateDict
+from lnhistoryclient.model.NodeAnnouncement import NodeAnnouncement, NodeAnnouncementDict, Address
+from lnhistoryclient.model.ChannelAnnouncement import ChannelAnnouncement, ChannelAnnouncementDict
 
 # --- CONFIGURATION ---
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -25,16 +27,59 @@ POSTGRES_URI = os.getenv("POSTGRES_URI")
 ZMQ_SOURCES = os.getenv("ZMQ_SOURCES", "tcp://host.docker.internal:5675,tcp://host.docker.internal:5676").split(",")
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("processor")
+logger = logging.getLogger("gossip-processor")
 
-# Define Metrics
-MSG_COUNTER = Counter('gossip_messages_total', 'Total gossip messages', ['type', 'source'])
+# --- TYPEDEFS (Documentation-as-Code) ---
+
+class PluginEventMetadata(TypedDict):
+    type: int
+    name: str
+    timestamp: int
+    sender_node_id: str
+    length: int
+
+class BasePluginEvent(TypedDict):
+    metadata: PluginEventMetadata
+    raw_hex: str
+
+# Helper to decode aliases safely
+def decode_alias(alias_bytes: bytes) -> str:
+    try:
+        return alias_bytes.decode("utf-8").strip("\x00")
+    except UnicodeDecodeError:
+        try:
+            cleaned = alias_bytes.strip(b"\x00")
+            return codecs.decode(cleaned, "punycode")
+        except Exception:
+            return alias_bytes.hex()
+
+# --- METRICS DEFINITIONS ---
+MSG_COUNTER = Counter('gossip_messages_total', 'Total gossip messages received', ['type', 'source'])
+UNIQUE_MSG_COUNTER = Counter('gossip_unique_total', 'Number of unique messages (first time seen)', ['type'])
+DUPLICATE_MSG_COUNTER = Counter('gossip_duplicates_total', 'Number of duplicate messages (already in DB)', ['type', 'source'])
+
+LAG_HISTOGRAM = Histogram(
+    'gossip_processing_lag_seconds', 
+    'Time difference between Gossip Timestamp and Processing Time',
+    buckets=(0.1, 0.5, 1.0, 5.0, 10.0, 60.0, 300.0, 1800.0, 3600.0, 86400.0)
+)
+
+DB_DURATION = Histogram(
+    'gossip_db_duration_seconds', 
+    'Time spent executing database insertions',
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0, 5.0)
+)
+
+QUEUE_SIZE = Gauge('gossip_queue_depth', 'Current number of messages waiting in the internal queue')
+SCD_CLOSURES = Counter('gossip_scd_closures_total', 'Number of historical records closed (SCD Type 2)', ['table'])
+ORPHANS = Counter('gossip_orphans_total', 'Number of updates received for unknown channels')
+
 
 class Database:
     def __init__(self, conn_str):
         self.pool = ConnectionPool(conn_str, min_size=4, max_size=20)
         self.pool.wait()
-        logger.info("✅ Connected to PostgreSQL")
+        logger.info("--- Connected to PostgreSQL ---")
 
     def register_collector(self, collector_node_id, seen_at_dt):
         with self.pool.connection() as conn:
@@ -58,78 +103,60 @@ class Database:
 
     def insert_content(self, gossip_id, msg_type, raw_bytes, parsed_obj, timestamp_int):
         """
-        Inserts content using the parsed object from lnhistoryclient.
+        Parses the list of address dicts using lnhistoryclient and inserts them.
         """
         dt = datetime.fromtimestamp(timestamp_int, timezone.utc)
+
+        with DB_DURATION.time():
+            with self.pool.connection() as conn:
+                with conn.cursor() as cur:
+                    # 1. Inventory Check
+                    cur.execute("""
+                        INSERT INTO gossip_inventory (gossip_id, type, first_seen_at)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (gossip_id) DO NOTHING
+                    """, (gossip_id, msg_type, dt))
+                    
+                    if cur.rowcount == 0:
+                        return False # Duplicate
+
+                    # 2. Insert Content
+                    # parsed_obj is a strongly typed dataclass here
+                    if msg_type == 257: 
+                        self._handle_node_announcement(cur, gossip_id, dt, raw_bytes, parsed_obj)
+                    elif msg_type == 256:
+                        self._handle_channel_announcement(cur, gossip_id, dt, raw_bytes, parsed_obj)
+                    elif msg_type == 258:
+                        self._handle_channel_update(cur, gossip_id, dt, raw_bytes, parsed_obj)
+
+                    return True
+            
+    def insert_node_addresses(self, cur, gossip_id, addresses: List[Address]):
+        if not addresses: return
         
-        # Convert dataclass to dict for easy access
-        data = parsed_obj.to_dict()
-
-        with self.pool.connection() as conn:
-            with conn.cursor() as cur:
-                # 1. Inventory Check
-                cur.execute("""
-                    INSERT INTO gossip_inventory (gossip_id, type, first_seen_at)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (gossip_id) DO NOTHING
-                """, (gossip_id, msg_type, dt))
-                
-                if cur.rowcount == 0:
-                    return False # Duplicate
-
-                # 2. Insert Content
-                if msg_type == 257: # Node Announcement
-                    self._handle_node_announcement(cur, gossip_id, dt, raw_bytes, data)
-
-                elif msg_type == 256: # Channel Announcement
-                    self._handle_channel_announcement(cur, gossip_id, dt, raw_bytes, data)
-
-                elif msg_type == 258: # Channel Update
-                    self._handle_channel_update(cur, gossip_id, dt, raw_bytes, data)
-
-                return True
-            
-    def insert_node_addresses(self, cur, gossip_id, addresses):
-        """
-        Parses the list of address dicts from lnhistoryclient and inserts them.
-        """
-        if not addresses:
-            return
-
-        for addr_dict in addresses:
-            # 1. Extract Nested Type ID
-            type_obj = addr_dict.get('typ')
+        for addr in addresses:
             type_id = None
+            if addr.typ:
+                if isinstance(addr.typ, int):
+                    type_id = addr.typ
+                elif hasattr(addr.typ, 'id'):
+                    type_id = addr.typ.id
             
-            if isinstance(type_obj, dict):
-                type_id = type_obj.get('id')
-            elif isinstance(type_obj, int):
-                # Fallback just in case raw int is passed
-                type_id = type_obj
-            
-            address_str = addr_dict.get('addr')
-            port = addr_dict.get('port')
+            address_str = addr.addr
+            port = addr.port
 
-            # Only insert if we have valid data
             if type_id is not None and address_str:
                 cur.execute("""
                     INSERT INTO node_addresses (gossip_id, type_id, address, port)
                     VALUES (%s, %s, %s, %s)
                 """, (gossip_id, type_id, address_str, port))
 
-    def _handle_channel_announcement(self, cur, gossip_id, dt, raw_bytes, data):
-        """
-        Handles Channel Announcement (Type 256).
-        Edge Case: Nodes 1 & 2 might not exist yet. We must create placeholder entries for them.
-        """
-        # 1. Parse SCID to Integer (Critical for DB performance)
-        scid_str = data.get('scid') 
-        scid_int = self._parse_scid_to_int(scid_str)
-        
-        node1 = data.get('node_id_1')
-        node2 = data.get('node_id_2')
+    def _handle_channel_announcement(self, cur, gossip_id, dt, raw_bytes, data: ChannelAnnouncement):
+        scid_int = data.scid
+        node1 = data.node_id_1.hex()
+        node2 = data.node_id_2.hex()
 
-        # 2. EDGE CASE: Ensure both nodes exist in the 'nodes' table.
+        # 1. EDGE CASE: Ensure both nodes exist in the 'nodes' table.
         # We use ON CONFLICT DO NOTHING because we only want to ensure the ID exists.
         # We do NOT insert into 'node_announcements' (raw_gossip) because we haven't seen their metadata yet.
         # This effectively creates a "Ghost Node" or "Stub" that satisfies the Foreign Key.
@@ -142,7 +169,7 @@ class Database:
                     SET last_seen = GREATEST(nodes.last_seen, EXCLUDED.last_seen)
                 """, (nid, dt, dt))
 
-        # 3. Insert the Channel
+         # 2. Insert the Channel
         cur.execute("""
             INSERT INTO channels 
             (gossip_id, scid, source_node_id, target_node_id, 
@@ -151,18 +178,17 @@ class Database:
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (scid) DO NOTHING
         """, (
-            gossip_id, scid_int,
-            node1, node2,
-            data.get('node_signature_1'), data.get('node_signature_2'),
-            data.get('bitcoin_signature_1'), data.get('bitcoin_signature_2'),
-            bytes.fromhex(data.get('features', '')) if data.get('features') else None,
-            data.get('chain_hash'),
-            data.get('bitcoin_key_1'), data.get('bitcoin_key_2'),
+            gossip_id, scid_int, node1, node2,
+            data.node_signature_1.hex(), data.node_signature_2.hex(),
+            data.bitcoin_signature_1.hex(), data.bitcoin_signature_2.hex(),
+            data.features, # BYTEA
+            data.chain_hash.hex(),
+            data.bitcoin_key_1.hex(), data.bitcoin_key_2.hex(),
             raw_bytes
         ))
 
-    def _handle_node_announcement(self, cur, gossip_id, dt, raw_bytes, data):
-        node_id = data.get('node_id')
+    def _handle_node_announcement(self, cur, gossip_id, dt, raw_bytes, data: NodeAnnouncement):
+        node_id = data.node_id.hex()
         if not node_id: return
 
         # 1. Ensure public node stub exists
@@ -182,6 +208,7 @@ class Database:
         
         # Determine valid_to for the NEW record
         if cur.rowcount > 0:
+            SCD_CLOSURES.labels(table='node_announcements').inc()
             # We successfully closed the old tip. We are now the new tip.
             valid_to = None
         else:
@@ -209,25 +236,27 @@ class Database:
             (gossip_id, node_id, valid_from, valid_to, signature, features, rgb_color, alias, raw_gossip)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
-            gossip_id, node_id, dt, valid_to,
-            data.get('signature'),
-            bytes.fromhex(data.get('features', '')) if data.get('features') else None,
-            data.get('rgb_color'),
-            data.get('alias'),
+            gossip_id, 
+            node_id, 
+            dt, 
+            valid_to,
+            data.signature.hex(),
+            data.features, 
+            data.rgb_color.hex(),
+            decode_alias(data.alias),
             raw_bytes
         ))
         
-        self.insert_node_addresses(cur, gossip_id, data.get('addresses', []))
+        self.insert_node_addresses(cur, gossip_id, data.addresses)
 
-    def _handle_channel_update(self, cur, gossip_id, dt, raw_bytes, data):
-        scid_str = data.get('scid')
-        scid_int = self._parse_scid_to_int(scid_str)
-        flags = int(data.get('channel_flags', 0))
-        direction = flags & 1
+    def _handle_channel_update(self, cur, gossip_id, dt, raw_bytes, data: ChannelUpdate):
+        scid_int = data.scid
+        direction = data.direction
         
         # 1. Orphan Check (This is just a warning, not an error)
         cur.execute("SELECT 1 FROM channels WHERE scid = %s", (scid_int,))
         if cur.fetchone() is None:
+            ORPHANS.inc()
             logger.warning(f"Orphan Update: SCID {scid_int} not found. Storing anyway.")
 
         # 2. SCD Logic: Try to close previous update
@@ -238,6 +267,7 @@ class Database:
         """, (dt, scid_int, str(direction), dt))
 
         if cur.rowcount > 0:
+            SCD_CLOSURES.labels(table='channel_updates').inc()
             valid_to = None
         else:
             # Out-of-order handling
@@ -249,8 +279,7 @@ class Database:
             
             if current_tip:
                 valid_to = current_tip[0]
-                if dt >= valid_to:
-                    return # Skip invalid range
+                if dt >= valid_to: return
             else:
                 valid_to = None
 
@@ -263,24 +292,23 @@ class Database:
              fee_proportional_millionths, htlc_maximum_msat, raw_gossip)
             VALUES (%s, %s, %s::bit, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
-            gossip_id, scid_int, str(direction), dt, valid_to,
-            data.get('signature'), data.get('chain_hash'),
-            data.get('message_flags'), data.get('channel_flags'),
-            data.get('cltv_expiry_delta'), data.get('htlc_minimum_msat'),
-            data.get('fee_base_msat'), data.get('fee_proportional_millionths'),
-            data.get('htlc_maximum_msat'),
+            gossip_id, 
+            scid_int, 
+            str(direction), 
+            dt, 
+            valid_to,
+            data.signature.hex(), 
+            data.chain_hash.hex(),
+            int.from_bytes(data.message_flags, 'big'), 
+            int.from_bytes(data.channel_flags, 'big'),
+            data.cltv_expiry_delta, 
+            data.htlc_minimum_msat,
+            data.fee_base_msat, 
+            data.fee_proportional_millionths,
+            data.htlc_maximum_msat,
             raw_bytes
         ))
 
-    def _parse_scid_to_int(self, scid):
-        """Handles various formats your lib might return"""
-        if isinstance(scid, int): return scid
-        if not scid or 'x' not in str(scid): return None
-        try:
-            parts = str(scid).split('x')
-            return (int(parts[0]) << 40) | (int(parts[1]) << 16) | int(parts[2])
-        except:
-            return None
 
 class GossipProcessor:
     def __init__(self):
@@ -318,73 +346,66 @@ class GossipProcessor:
     def calculate_gossip_id(self, raw_bytes: bytes) -> str:
         return hashlib.sha256(raw_bytes).hexdigest()
 
-    def process_msg(self, msg):
+    def process_msg(self, msg: BasePluginEvent):
+        """
+        Process a single gossip message.
+        Expected format: BasePluginEvent (Metadata + Hex String)
+        """
         try:
-            metadata = msg.get('metadata', {})
-            raw_hex = msg.get('raw_hex')
+            # Type-Safe Access
+            raw_hex = msg['raw_hex']
+            metadata = msg['metadata']
             
-            if not raw_hex or not metadata:
-                return
+            if not raw_hex: return
 
-            # 1. Decode Hex to Bytes
             raw_bytes_full = bytes.fromhex(raw_hex)
-            
-            # 2. Calculate ID from the FULL RAW MESSAGE
             gossip_id = self.calculate_gossip_id(raw_bytes_full)
-
-            # 3. Prepare data for the Parser
             raw_payload_with_type = self._strip_varint_len(raw_bytes_full)
             payload_body_only = strip_known_message_type(raw_payload_with_type)
+            msg_type = metadata['type']
             
-            # 4. Parse using lnhistoryclient
-            msg_type = metadata.get('type')
             parsed_obj = None
             parsed_obj: ChannelUpdate | ChannelAnnouncement | NodeAnnouncement
-            
             try:
                 parser_func = parser_factory.get_parser_by_message_type(msg_type)
                 parsed_obj = parser_func(payload_body_only)
             except Exception as e:
+                # Silence known internal messages if parser fails, else warn
+                if msg_type not in [256, 257, 258]: return
                 logger.warning(f"Failed to parse message type {msg_type}: {e}")
                 return
 
-            collector_node_id = metadata.get('sender_node_id')
+            collector_node_id = metadata['sender_node_id']
             
-            # Use the timestamp from the MESSAGE payload if available (more accurate for "Gossip Time")
-            # Fallback to metadata timestamp (Receipt Time)
-            gossip_ts = metadata.get('timestamp')
+            # --- METRICS & TIMESTAMP LOGIC ---
+            receipt_ts_int = metadata['timestamp']
+            receipt_dt = datetime.fromtimestamp(receipt_ts_int, timezone.utc)
             
-            # Try to extract actual gossip timestamp from parsed object for better logging
+            gossip_ts_int = receipt_ts_int
             if hasattr(parsed_obj, 'timestamp'):
-                gossip_ts = parsed_obj.timestamp
-            
-            dt = datetime.fromtimestamp(gossip_ts, timezone.utc)
+                gossip_ts_int = parsed_obj.timestamp
             
             # Calculate Lag (How old is this message?)
             now = datetime.now(timezone.utc)
-            lag_seconds = (now - dt).total_seconds()
+            lag_seconds = (now - receipt_dt).total_seconds()
 
             MSG_COUNTER.labels(type=msg_type, source=collector_node_id).inc()
-            
-            # 5. DB Operations
-            # Note: We register collector using 'now' (receipt time) to track aliveness, 
-            # but we store content using 'dt' (gossip time).
-            receipt_dt = datetime.fromtimestamp(metadata.get('timestamp'), timezone.utc)
-            
+            LAG_HISTOGRAM.observe(lag_seconds)
+
+            # FILTER: IGNORE INTERNAL MESSAGES
+            if msg_type not in [256, 257, 258]:
+                return
+
+            # DB Operations
             self.db.register_collector(collector_node_id, receipt_dt)
-            
-            # Insert Content
-            is_new = self.db.insert_content(gossip_id, msg_type, raw_bytes_full, parsed_obj, gossip_ts)
-            
-            # Log Observation
+            is_new = self.db.insert_content(gossip_id, msg_type, raw_bytes_full, parsed_obj, gossip_ts_int)
             self.db.insert_observation(gossip_id, collector_node_id, receipt_dt)
 
             if is_new:
                 self.processed_count += 1
+                UNIQUE_MSG_COUNTER.labels(type=msg_type).inc()
                 
-                # ENHANCED LOGGING
-                # Log detailed info every 50 messages OR if lag is > 1 hour (catching up)
-                if self.processed_count % 50 == 0 or lag_seconds > 3600:
+                if self.processed_count % 50 == 0 or lag_seconds > 600:
                     type_name = "Unknown"
                     if msg_type == 256: type_name = "channel_announcement"
                     elif msg_type == 257: type_name = "node_announcement"
@@ -393,22 +414,22 @@ class GossipProcessor:
                     logger.info(
                         f"Processed {self.processed_count} | "
                         f"Type: {type_name} ({msg_type}) | "
-                        f"Time: {dt.strftime('%H:%M:%S')} (Lag: {lag_seconds:.0f}s) | "
-                        f"Source: {collector_node_id[:8]}..."
+                        f"Receipt: {receipt_dt.strftime('%H:%M:%S')} (Lag: {lag_seconds:.2f}s) | "
+                        f"Src: {collector_node_id[:8]}..."
                     )
+            else:
+                DUPLICATE_MSG_COUNTER.labels(type=msg_type, source=collector_node_id).inc()
             
         except Exception as e:
             logger.error(f"Processing Error: {e}", exc_info=True)
-
-
+            
     def zmq_worker(self, zmq_uri):
         ctx = zmq.Context()
         sock = ctx.socket(zmq.SUB)
         try:
             sock.connect(zmq_uri)
             sock.setsockopt_string(zmq.SUBSCRIBE, "")
-            logger.info(f"🎧 Connected to ZMQ: {zmq_uri}")
-            
+            logger.info(f"--- Connected to ZMQ: {zmq_uri} ---")
             poller = zmq.Poller()
             poller.register(sock, zmq.POLLIN)
 
@@ -416,15 +437,17 @@ class GossipProcessor:
                 events = dict(poller.poll(1000))
                 if sock in events:
                     topic, msg_bytes = sock.recv_multipart()
-                    self.queue.put(json.loads(msg_bytes.decode('utf-8')))
+                    msg_dict = json.loads(msg_bytes.decode('utf-8'))
+                    self.queue.put(cast(BasePluginEvent, msg_dict))
         except Exception as e:
             logger.error(f"ZMQ Error {zmq_uri}: {e}")
         finally:
             sock.close()
 
     def db_worker(self):
-        logger.info("💾 DB Worker started")
+        logger.info("--- DB Worker started ---")
         while self.running:
+            QUEUE_SIZE.set(self.queue.qsize())
             try:
                 msg = self.queue.get(timeout=1)
                 self.process_msg(msg)
@@ -450,7 +473,7 @@ class GossipProcessor:
         threads.append(db_t)
 
         def signal_handler(sig, frame):
-            logger.info("Stopping...")
+            logger.info("--- Stopping... ---")
             self.running = False
             sys.exit(0)
         signal.signal(signal.SIGINT, signal_handler)
