@@ -247,7 +247,7 @@ class Database:
             raw_bytes
         ))
         
-        self.insert_node_addresses(cur, gossip_id, data.addresses)
+        self.insert_node_addresses(cur, gossip_id, data._parse_addresses)
 
     def _handle_channel_update(self, cur, gossip_id, dt, raw_bytes, data: ChannelUpdate):
         scid_int = data.scid
@@ -414,7 +414,7 @@ class GossipProcessor:
                     logger.info(
                         f"Processed {self.processed_count} | "
                         f"Type: {type_name} ({msg_type}) | "
-                        f"Receipt: {receipt_dt.strftime('%H:%M:%S')} (Lag: {lag_seconds:.2f}s) | "
+                        f"Receipt: {receipt_dt.strftime("%d/%m/%Y, %H:%M:%S")} (Lag: {lag_seconds:.2f}s) | "
                         f"Src: {collector_node_id[:8]}..."
                     )
             else:
