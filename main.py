@@ -356,7 +356,6 @@ class GossipProcessor:
             # Type-Safe Access
             raw_hex = msg['raw_hex']
             metadata = msg['metadata']
-            logger.info(f"Process start of {metadata}")
             
             if not raw_hex: return
 
