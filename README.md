@@ -4,7 +4,7 @@
 
 The **Gossip Processor** is the central ingestion engine of the `ln-history` platform. It subscribes to multiple ZeroMQ `PUB` sockets (from Core Lightning nodes), deduplicates incoming gossip messages in real-time, and persists them into a PostgreSQL database.
 
-## 🧠 Architecture
+## Architecture
 
 The service operates on a **Linear Pipeline** model:
 `ZMQ Source` $\rightarrow$ `Deduplication` $\rightarrow$ `Observation Logging` $\rightarrow$ `Parsing` $\rightarrow$ `Persistence`.
@@ -17,7 +17,7 @@ The service operates on a **Linear Pipeline** model:
 
 ---
 
-## 📊 Database Schema
+## Database Schema
 
 The processor writes to two main categories of tables: **Statistics** (Observation Data) and **Content** (The Gossip Payloads).
 
@@ -43,7 +43,7 @@ These tables store the parsed BOLT #7 data **and** the raw binary blob. They use
 
 ---
 
-## 🔄 Control Flow
+## Control Flow
 
 The following diagram illustrates the exact lifecycle of an incoming gossip message.
 
@@ -90,7 +90,7 @@ sequenceDiagram
 ```
     
     
-## ⚙️ Detailed Logic by Message Type
+## Detailed Logic by Message Type
 1. Channel Announcement (type: `256`)
 
     **Trigger**: Received a channel_announcement.
@@ -125,23 +125,41 @@ sequenceDiagram
     - Update the previous row: `set valid_to = current_timestamp`.
     - Insert the new row into `channel_updates` with `valid_from` = `current_timestamp`.
 
-## 📈 Monitoring & Metrics
-The service exposes real-time metrics for Grafana visualization.
+## Monitoring & Metrics
 
-| Metric Name | Type | Description |
-| :--- | :--- | :--- |
-| `ln_gossip_received_total` | Counter | Total raw messages received (labeled by `source_node`). |
-| `ln_gossip_new_total` | Counter | Total **globally new** messages (Inventory inserts). |
-| `ln_db_insert_latency_seconds` | Histogram | Time taken to perform DB transactions. |
-| `ln_orphan_updates_total` | Counter | Number of channel updates received for unknown channels. |
+The service exposes real-time metrics via a Prometheus endpoint (default port `8000`) for Grafana visualization. 
+These metrics provide visibility into both the **operational health** of the processor and the **behavior of the Lightning Network**.
 
-### Insights Goals
-This setup allows us to answer complex queries via Grafana/SQL:
-- *"Which collector (Alice/Bob) hears about fee changes faster?"*
-- *"What is the average propagation delay of a block-mined channel?"*
-- *"Show me the fee history of Channel X over the last year."*
+| Metric Name | Type | Labels | Description |
+| :--- | :--- | :--- | :--- |
+| `gossip_messages_total` | Counter | `type`, `source` | Total raw messages received from all sources (internal & external). |
+| `gossip_unique_total` | Counter | `type` | Count of **globally new** messages (First time seen by the database). |
+| `gossip_duplicates_total` | Counter | `type`, `source` | Count of messages that were already known (Redundant gossip). |
+| `gossip_processing_lag_seconds` | Histogram | None | Latency between **Gossip Timestamp** (creation) and **Processing Time** (ingestion). Used to track sync status. |
+| `gossip_db_duration_seconds` | Histogram | None | Time taken to perform database transactions (Inventory check + Insert). |
+| `gossip_queue_depth` | Gauge | None | Current number of messages buffered in the internal Python queue. |
+| `gossip_scd_closures_total` | Counter | `table` | Number of historical records closed (validity range updated) due to new data. |
+| `gossip_orphans_total` | Counter | None | Number of `channel_update` messages received for channels that do not exist in ln-history-database yet. |
 
-## 🚀 Running the ServiceThe service is containerized and managed via Docker Compose.
+### Insights & Dashboards
+This instrumentation enables visualizations in Grafana:
+
+1.  **Network Convergence Rate:**
+    * Calculated as `rate(gossip_duplicates_total) / rate(gossip_unique_total)`.
+    * *Insight:* How much "overlap" exists between your collecting nodes? (100% = Perfect consensus).
+
+2.  **Propagation Lag:**
+    * Using `gossip_processing_lag_seconds`.
+    * *Insight:* Are we processing live data (< 5s lag) or syncing historical backfill (> 1h lag)?
+
+3.  **Network Churn (Volatility):**
+    * Using `gossip_scd_closures_total`.
+    * *Insight:* How frequently are nodes updating fees or opening/closing channels?
+
+4.  **Collector Performance:**
+    * *"Which node (Alice or Bob) is the primary source of new information?"* (Using `gossip_unique_total` by source).
+
+## Running the ServiceThe service is containerized and managed via Docker Compose.
 ```sh
 # Build and Run
 docker compose up -d --build gossip-processor
@@ -154,8 +172,8 @@ docker logs -f gossip-processor
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `ZMQ_SOURCES` | `tcp://127.0.0.1:5675` | Comma-separated list of ZMQ endpoints. |
-| `POSTGRES_URI` | `postgresql://...` | Connection string for the database. |
-| `LOG_LEVEL` | `INFO` | Verbosity of logs (`DEBUG`, `INFO`, `WARN`). |
+| `POSTGRES_URI` | `postgresql://...` | Connection string for the ln-history-database. |
+| `LOG_LEVEL` | `INFO` | Verbosity of logs (`INFO`, `WARN`, `ERROR`). |
 
 
 ## Deploy and Publish
