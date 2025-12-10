@@ -89,7 +89,6 @@ sequenceDiagram
     deactivate GP
 ```
     
-    
 ## Detailed Logic by Message Type
 1. Channel Announcement (type: `256`)
 
