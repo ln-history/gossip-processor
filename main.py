@@ -23,8 +23,10 @@ from lnhistoryclient.model.ChannelAnnouncement import ChannelAnnouncement, Chann
 
 # --- CONFIGURATION ---
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-POSTGRES_URI = os.getenv("POSTGRES_URI")
-ZMQ_SOURCES = os.getenv("ZMQ_SOURCES", "tcp://host.docker.internal:5675,tcp://host.docker.internal:5676").split(",")
+# POSTGRES_URI = os.getenv("POSTGRES_URI")
+POSTGRES_URI = "postgresql://admin:zDEaKsvyshZd3TSPWbmt774duMhqQuHXQpgvcWN9@localhost:5432/lnhistory"
+# ZMQ_SOURCES = os.getenv("ZMQ_SOURCES", "tcp://host.docker.internal:5675,tcp://host.docker.internal:5676").split(",")
+ZMQ_SOURCES = "tcp://localhost:5675,tcp://localhost:5676".split(",")
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("gossip-processor")
@@ -247,7 +249,7 @@ class Database:
             raw_bytes
         ))
         
-        self.insert_node_addresses(cur, gossip_id, data._parse_addresses)
+        self.insert_node_addresses(cur, gossip_id, data._parse_addresses())
 
     def _handle_channel_update(self, cur, gossip_id, dt, raw_bytes, data: ChannelUpdate):
         scid_int = data.scid
@@ -352,9 +354,11 @@ class GossipProcessor:
         Expected format: BasePluginEvent (Metadata + Hex String)
         """
         try:
+
             # Type-Safe Access
             raw_hex = msg['raw_hex']
             metadata = msg['metadata']
+            logger.info(f"Process start of {metadata}")
             
             if not raw_hex: return
 
