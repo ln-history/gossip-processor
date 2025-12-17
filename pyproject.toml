@@ -1,6 +1,6 @@
 [project]
 name = "gossip-processor"
-version = "0.6.1"
+version = "0.7.0"
 description = ""
 authors = [
     { name = "Fabian Kraus", email = "fabian.felix.kraus@gmail.com" }
