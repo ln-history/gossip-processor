@@ -36,7 +36,7 @@ logger = logging.getLogger("gossip-processor")
 MSG_COUNTER = Counter('gossip_messages_total', 'Total gossip messages received', ['type', 'source'])
 UNIQUE_MSG_COUNTER = Counter('gossip_unique_total', 'Number of unique messages (first time seen)', ['type', 'source'])
 DUPLICATE_MSG_COUNTER = Counter('gossip_duplicates_total', 'Number of duplicate messages (already in DB)', ['type', 'source'])
-LAG_HISTOGRAM = Histogram('gossip_processing_lag_seconds', 'Lag', buckets=(0.1, 1.0, 10.0, 60.0, 300.0, 3600.0))
+LAG_HISTOGRAM = Histogram('gossip_processing_lag_seconds', 'Lag', ['source'], buckets=(0.1, 1.0, 10.0, 60.0, 300.0, 3600.0))
 DB_DURATION = Histogram('gossip_db_batch_duration_seconds', 'Time spent executing batch insertions', buckets=(0.1, 0.5, 1.0, 2.0, 5.0))
 QUEUE_SIZE = Gauge('gossip_queue_depth', 'Current number of messages waiting')
 SCD_CLOSURES = Counter('gossip_scd_closures_total', 'SCD Type 2 closures', ['table'])
@@ -312,7 +312,7 @@ class GossipProcessor:
             lag_seconds = (now - receipt_dt).total_seconds()
 
             MSG_COUNTER.labels(type=msg_type, source=collector_node_id).inc()
-            LAG_HISTOGRAM.observe(lag_seconds)
+            LAG_HISTOGRAM.labels(source=collector_node_id).observe(lag_seconds)
 
             if msg_type not in [MSG_TYPE_NODE_ANNOUNCEMENT, MSG_TYPE_CHANNEL_ANNOUNCEMENT, MSG_TYPE_CHANNEL_UPDATE]:
                 return
