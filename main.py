@@ -6,10 +6,9 @@ import threading
 import time
 import signal
 import sys
-import codecs
 from queue import Queue, Empty
 from datetime import datetime, timezone
-from typing import List, TypedDict, cast
+from typing import List, cast
 
 import zmq
 from psycopg_pool import ConnectionPool
@@ -35,7 +34,7 @@ logger = logging.getLogger("gossip-processor")
 
 # --- METRICS ---
 MSG_COUNTER = Counter('gossip_messages_total', 'Total gossip messages received', ['type', 'source'])
-UNIQUE_MSG_COUNTER = Counter('gossip_unique_total', 'Number of unique messages (first time seen)', ['type'])
+UNIQUE_MSG_COUNTER = Counter('gossip_unique_total', 'Number of unique messages (first time seen)', ['type', 'source'])
 DUPLICATE_MSG_COUNTER = Counter('gossip_duplicates_total', 'Number of duplicate messages (already in DB)', ['type', 'source'])
 LAG_HISTOGRAM = Histogram('gossip_processing_lag_seconds', 'Lag', buckets=(0.1, 1.0, 10.0, 60.0, 300.0, 3600.0))
 DB_DURATION = Histogram('gossip_db_batch_duration_seconds', 'Time spent executing batch insertions', buckets=(0.1, 0.5, 1.0, 2.0, 5.0))
@@ -50,7 +49,6 @@ class Database:
         self.pool.wait()
         logger.info("--- Connected to PostgreSQL ---")
 
-    # MODIFIED: Accepts 'cur' to reuse transaction
     def register_collector(self, cur, collector_node_id, seen_at_dt):
         cur.execute("""
             INSERT INTO collectors (node_id, last_collection_at, total_messages_collected)
@@ -60,7 +58,6 @@ class Database:
                 total_messages_collected = collectors.total_messages_collected + 1
         """, (collector_node_id, seen_at_dt))
 
-    # MODIFIED: Accepts 'cur'
     def insert_observation(self, cur, gossip_id, collector_node_id, seen_at_dt):
         cur.execute("""
             INSERT INTO gossip_observations (gossip_id, collector_node_id, seen_at)
@@ -68,7 +65,6 @@ class Database:
             ON CONFLICT (gossip_id, collector_node_id) DO NOTHING
         """, (gossip_id, collector_node_id, seen_at_dt))
 
-    # MODIFIED: Accepts 'cur' and removed self.pool logic
     def insert_content(self, cur, gossip_id, msg_type, raw_bytes, parsed_obj, timestamp_int):
         dt = datetime.fromtimestamp(timestamp_int, timezone.utc)
         
@@ -116,7 +112,7 @@ class Database:
         # 1. EDGE CASE: Ensure both nodes exist in the 'nodes' table.
         # We use ON CONFLICT DO NOTHING because we only want to ensure the ID exists.
         # We do NOT insert into 'node_announcements' (raw_gossip) because we haven't seen their metadata yet.
-        # This effectively creates a "Ghost Node" or "Stub" that satisfies the Foreign Key.
+        # This effectively creates a "Stub" that satisfies the Foreign Key.
         for nid in [node1, node2]:
             if nid:
                 cur.execute("""
@@ -328,7 +324,7 @@ class GossipProcessor:
 
             if is_new:
                 self.processed_count += 1
-                UNIQUE_MSG_COUNTER.labels(type=msg_type).inc()
+                UNIQUE_MSG_COUNTER.labels(type=msg_type, source=collector_node_id).inc()
                 if self.processed_count % 100 == 0:
                      logger.info(f"Processed {self.processed_count} (Lag: {lag_seconds:.2f}s)")
             else:

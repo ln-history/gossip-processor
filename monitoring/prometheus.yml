@@ -1,7 +1,0 @@
-global:
-  scrape_interval: 15s
-
-scrape_configs:
-  - job_name: 'gossip_processor'
-    static_configs:
-      - targets: ['gossip-processor:8000'] # We will expose metrics here
