@@ -250,23 +250,25 @@ class GossipProcessor:
         """
         if len(data) < 1:
             return data
-            
+
         first = data[0]
-        
+
         # Determine VarInt size based on the first byte prefix
         if first < 0xfd:
-            # 1 byte VarInt (values < 0xfd)
             return data[1:]
         elif first == 0xfd:
-            # 3 bytes total (prefix + uint16)
+            if len(data) < 3:
+                return b''
             return data[3:]
         elif first == 0xfe:
-            # 5 bytes total (prefix + uint32)
+            if len(data) < 5:
+                return b''
             return data[5:]
         elif first == 0xff:
-            # 9 bytes total (prefix + uint64)
+            if len(data) < 9:
+                return b''
             return data[9:]
-        
+
         return data
 
     def calculate_gossip_id(self, raw_bytes: bytes) -> str:
@@ -281,20 +283,28 @@ class GossipProcessor:
                 return
 
             raw_bytes_full = bytes.fromhex(raw_hex)
-            gossip_id = self.calculate_gossip_id(raw_bytes_full)
             raw_payload_with_type = self._strip_varint_len(raw_bytes_full)
+            if len(raw_payload_with_type) < 2:
+                logger.warning(f"Message too short after stripping varint: {raw_hex[:40]}")
+                return
+            gossip_id = self.calculate_gossip_id(raw_payload_with_type)
             payload_body_only = strip_known_message_type(raw_payload_with_type)
             msg_type = metadata['type']
-            
+
+            binary_type = int.from_bytes(raw_payload_with_type[:2], 'big')
+            if binary_type != msg_type:
+                logger.warning(f"Type mismatch: metadata={msg_type}, binary={binary_type}. Skipping.")
+                return
+
             parsed_obj = None
             parsed_obj: ChannelUpdate | ChannelAnnouncement | NodeAnnouncement
             try:
                 parser_func = parser_factory.get_parser_by_message_type(msg_type)
                 parsed_obj = parser_func(payload_body_only)
-            except Exception:
+            except Exception as e:
                 if msg_type in [MSG_TYPE_NODE_ANNOUNCEMENT, MSG_TYPE_CHANNEL_ANNOUNCEMENT, MSG_TYPE_CHANNEL_UPDATE]:
                     logger.warning(f"Failed to parse message type {msg_type} with raw message {msg}: {e}")
-                    return # Skip parse errors silently or log debug
+                    return
                 return
 
             collector_node_id = metadata['sender_node_id']
