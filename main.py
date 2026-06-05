@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import hashlib
+import struct
 import threading
 import time
 import signal
@@ -10,6 +11,7 @@ from queue import Queue, Empty
 from datetime import datetime, timezone
 from typing import List, cast
 
+import psycopg
 import zmq
 from psycopg_pool import ConnectionPool
 from prometheus_client import start_http_server, Counter, Gauge, Histogram
@@ -274,6 +276,18 @@ class GossipProcessor:
     def calculate_gossip_id(self, raw_bytes: bytes) -> str:
         return hashlib.sha256(raw_bytes).hexdigest()
 
+    def _build_raw_gossip(self, raw_payload_with_type: bytes) -> bytes:
+        """Encode as varint(payload_len) + 2-byte msg_type + payload."""
+        payload_len = len(raw_payload_with_type) - 2
+        if payload_len < 0xfd:
+            varint = bytes([payload_len])
+        elif payload_len <= 0xffff:
+            varint = b'\xfd' + struct.pack('<H', payload_len)
+        elif payload_len <= 0xffffffff:
+            varint = b'\xfe' + struct.pack('<I', payload_len)
+        else:
+            varint = b'\xff' + struct.pack('<Q', payload_len)
+        return varint + raw_payload_with_type
 
     def process_msg_in_batch(self, cur, msg: BasePluginEvent):
         try:
@@ -287,7 +301,8 @@ class GossipProcessor:
             if len(raw_payload_with_type) < 2:
                 logger.warning(f"Message too short after stripping varint: {raw_hex[:40]}")
                 return
-            gossip_id = self.calculate_gossip_id(raw_payload_with_type)
+            raw_gossip_bytes = self._build_raw_gossip(raw_payload_with_type)
+            gossip_id = self.calculate_gossip_id(raw_gossip_bytes)
             payload_body_only = strip_known_message_type(raw_payload_with_type)
             msg_type = metadata['type']
 
@@ -329,7 +344,7 @@ class GossipProcessor:
 
             # DB Operations
             self.db.register_collector(cur, collector_node_id, receipt_dt)
-            is_new = self.db.insert_content(cur, gossip_id, msg_type, raw_bytes_full, parsed_obj, gossip_ts_int)
+            is_new = self.db.insert_content(cur, gossip_id, msg_type, raw_gossip_bytes, parsed_obj, gossip_ts_int)
             self.db.insert_observation(cur, gossip_id, collector_node_id, receipt_dt)
 
             if is_new:
@@ -340,6 +355,8 @@ class GossipProcessor:
             else:
                 DUPLICATE_MSG_COUNTER.labels(type=msg_type, source=collector_node_id).inc()
             
+        except psycopg.Error:
+            raise
         except Exception as e:
             logger.error(f"Processing Error: {e}", exc_info=True)
             

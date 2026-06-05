@@ -2,6 +2,8 @@ ln-history-database-data/
 prometheus-data/
 grafana-data/
 monitoring/
+database-schema/
+temp.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
