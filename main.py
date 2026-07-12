@@ -69,20 +69,24 @@ class Database:
 
     def insert_content(self, cur, gossip_id, msg_type, raw_bytes, parsed_obj, timestamp_int):
         dt = datetime.fromtimestamp(timestamp_int, timezone.utc)
-        
-        # 1. Inventory Check
+
+        # 1. Inventory check — RETURNING internal_id avoids a second round-trip.
         cur.execute("""
             INSERT INTO gossip_inventory (gossip_id, type, first_seen_at)
             VALUES (%s, %s, %s)
             ON CONFLICT (gossip_id) DO NOTHING
+            RETURNING internal_id
         """, (gossip_id, msg_type, dt))
-        
-        if cur.rowcount == 0:
-            return False # Duplicate
 
-        # 2. Insert Content
-        if msg_type == 257: 
-            self._handle_node_announcement(cur, gossip_id, dt, raw_bytes, parsed_obj)
+        row = cur.fetchone()
+        if row is None:
+            return False  # Duplicate — already in inventory
+
+        internal_id = row[0]
+
+        # 2. Insert content
+        if msg_type == 257:
+            self._handle_node_announcement(cur, gossip_id, dt, raw_bytes, parsed_obj, internal_id)
         elif msg_type == 256:
             self._handle_channel_announcement(cur, gossip_id, dt, raw_bytes, parsed_obj)
         elif msg_type == 258:
@@ -140,49 +144,114 @@ class Database:
             data.bitcoin_key_1.hex(), data.bitcoin_key_2.hex(), raw_bytes
         ))
 
-    def _handle_node_announcement(self, cur, gossip_id, dt, raw_bytes, data: NodeAnnouncement):
+    def _handle_node_announcement(
+        self, cur, gossip_id: str, dt: datetime, raw_bytes: bytes,
+        data: NodeAnnouncement, internal_id: int
+    ) -> None:
         node_id = data.node_id.hex()
-        if not node_id: return
+        if not node_id:
+            return
 
-        # 1. Ensure public node stub exists
+        alias     = decode_alias(data.alias)
+        rgb_color = data.rgb_color.hex()
+        features  = data.features  # bytes | None
+
+        # 1. Ensure node stub exists.
         cur.execute("""
             INSERT INTO nodes (node_id, first_seen, last_seen)
             VALUES (%s, %s, %s)
             ON CONFLICT (node_id) DO UPDATE SET last_seen = EXCLUDED.last_seen
         """, (node_id, dt, dt))
 
-        # 2. SCD Logic: Try to close the PREVIOUS active record
-        # Added 'AND valid_from < %s' to prevent the "Range Error" crash.
-        # We only close the active record if we are actually newer than it.
+        # 2. SCD: close the current active row in _complete if we are newer.
         cur.execute("""
-            UPDATE node_announcements SET valid_to = %s 
-            WHERE node_id = %s AND valid_to IS NULL AND valid_from < %s
+            UPDATE node_announcements_complete
+            SET    valid_to = %s
+            WHERE  node_id    = %s
+              AND  valid_to   IS NULL
+              AND  valid_from < %s
         """, (dt, node_id, dt))
-        
-        valid_to = None
-        if cur.rowcount > 0:
-            SCD_CLOSURES.labels(table='node_announcements').inc()
-            # We successfully closed the old tip. We are now the new tip.
-            valid_to = None
-        else:
-            # We failed to update. Either:
-            # A) No previous record exists (First time seeing node) -> valid_to = None
-            # B) We are OLDER than the current tip (Out-of-order) -> valid_to = tip.valid_from
-            
-            cur.execute("SELECT valid_from FROM node_announcements WHERE node_id = %s AND valid_to IS NULL", (node_id,))
-            current_tip = cur.fetchone()
-            
-            if current_tip:
-                # Case B: We are history. Fill the gap before the current tip starts.
-                valid_to = current_tip[0]
-                if dt >= valid_to: return
 
+        complete_valid_to = None
+        if cur.rowcount > 0:
+            SCD_CLOSURES.labels(table='node_announcements_complete').inc()
+        else:
+            # Out-of-order: slot in before the current tip, or skip exact duplicate.
+            cur.execute("""
+                SELECT valid_from FROM node_announcements_complete
+                WHERE  node_id = %s AND valid_to IS NULL
+            """, (node_id,))
+            tip = cur.fetchone()
+            if tip:
+                complete_valid_to = tip[0]
+                if dt >= complete_valid_to:
+                    return  # Exact timestamp duplicate — nothing to do.
+
+        # 3. Insert into _complete. The BEFORE INSERT trigger classify_node_announcement()
+        #    computes is_data_update by comparing alias/rgb_color/features against the
+        #    most recent prior row in _complete — no Python-side classification needed.
+        #    RETURNING is_data_update lets us decide whether to mirror to node_announcements.
         cur.execute("""
-            INSERT INTO node_announcements 
-            (gossip_id, node_id, valid_from, valid_to, signature, features, rgb_color, alias, raw_gossip)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (gossip_id, node_id, dt, valid_to, data.signature.hex(), data.features, data.rgb_color.hex(), decode_alias(data.alias), raw_bytes))
-        
+            INSERT INTO node_announcements_complete
+            (gossip_id, node_id, valid_from, valid_to,
+             signature, features, rgb_color, alias, raw_gossip, internal_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (gossip_id) DO NOTHING
+            RETURNING is_data_update
+        """, (
+            gossip_id, node_id, dt, complete_valid_to,
+            data.signature.hex(), features, rgb_color, alias, raw_bytes, internal_id,
+        ))
+
+        complete_row = cur.fetchone()
+        if complete_row is None:
+            # Conflict — gossip_id already in _complete (shouldn't happen after
+            # the inventory check above, but be defensive).
+            self.insert_node_addresses(cur, gossip_id, data._parse_addresses())
+            return
+
+        is_data_update = complete_row[0]
+
+        # 4. Mirror to node_announcements only when something meaningful changed.
+        if is_data_update:
+            cur.execute("""
+                UPDATE node_announcements
+                SET    valid_to = %s
+                WHERE  node_id    = %s
+                  AND  valid_to   IS NULL
+                  AND  valid_from < %s
+            """, (dt, node_id, dt))
+
+            na_valid_to = None
+            if cur.rowcount > 0:
+                SCD_CLOSURES.labels(table='node_announcements').inc()
+            else:
+                cur.execute("""
+                    SELECT valid_from FROM node_announcements
+                    WHERE  node_id = %s AND valid_to IS NULL
+                """, (node_id,))
+                na_tip = cur.fetchone()
+                if na_tip:
+                    na_valid_to = na_tip[0]
+                    if dt >= na_valid_to:
+                        # Timestamp collision — _complete already written; skip na.
+                        self.insert_node_addresses(cur, gossip_id, data._parse_addresses())
+                        return
+
+            cur.execute("""
+                INSERT INTO node_announcements
+                (gossip_id, node_id, valid_from, valid_to,
+                 signature, features, rgb_color, alias, raw_gossip,
+                 is_data_update, internal_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (gossip_id) DO NOTHING
+            """, (
+                gossip_id, node_id, dt, na_valid_to,
+                data.signature.hex(), features, rgb_color, alias, raw_bytes,
+                True, internal_id,
+            ))
+
+        # 5. Addresses — always written, keyed to gossip_id.
         self.insert_node_addresses(cur, gossip_id, data._parse_addresses())
 
     def _handle_channel_update(self, cur, gossip_id, dt, raw_bytes, data: ChannelUpdate):
