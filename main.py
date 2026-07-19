@@ -51,23 +51,41 @@ class Database:
         self.pool.wait()
         logger.info("--- Connected to PostgreSQL ---")
 
-    def register_collector(self, cur, collector_node_id, seen_at_dt):
+    def register_collector(self, cur, collector_node_id, seen_at_dt) -> int:
+        """UPSERT collector stats and return its internal_collector_id.
+
+        gossip_observations.internal_collector_id is NOT NULL with an FK to
+        collectors, so this must run before insert_observation() for any
+        collector we have not seen before. ON CONFLICT DO UPDATE always returns
+        a row (unlike DO NOTHING), so the surrogate id comes back on both paths.
+        """
         cur.execute("""
             INSERT INTO collectors (node_id, last_collection_at, total_messages_collected)
             VALUES (%s, %s, 1)
-            ON CONFLICT (node_id) DO UPDATE 
+            ON CONFLICT (node_id) DO UPDATE
             SET last_collection_at = EXCLUDED.last_collection_at,
                 total_messages_collected = collectors.total_messages_collected + 1
+            RETURNING internal_collector_id
         """, (collector_node_id, seen_at_dt))
+        return cur.fetchone()[0]
 
-    def insert_observation(self, cur, gossip_id, collector_node_id, seen_at_dt):
+    def insert_observation(self, cur, internal_id, internal_collector_id, seen_at_dt, sender_ts_dt):
         cur.execute("""
-            INSERT INTO gossip_observations (gossip_id, collector_node_id, seen_at)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (gossip_id, collector_node_id) DO NOTHING
-        """, (gossip_id, collector_node_id, seen_at_dt))
+            INSERT INTO gossip_observations
+                (internal_id, internal_collector_id, seen_at, sender_timestamp)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (internal_id, internal_collector_id) DO NOTHING
+        """, (internal_id, internal_collector_id, seen_at_dt, sender_ts_dt))
 
     def insert_content(self, cur, gossip_id, msg_type, raw_bytes, parsed_obj, timestamp_int):
+        """Return (internal_id, is_new), or None if the id could not be resolved.
+
+        internal_id is needed on EVERY path, not just for new messages, because it
+        is half of the gossip_observations primary key. ON CONFLICT DO NOTHING
+        returns no row on conflict, and the conflict path is the common one — the
+        same gossip is seen by several collectors and re-broadcast repeatedly — so
+        the duplicate case has to re-read the id explicitly.
+        """
         dt = datetime.fromtimestamp(timestamp_int, timezone.utc)
 
         # 1. Inventory check — RETURNING internal_id avoids a second round-trip.
@@ -80,7 +98,19 @@ class Database:
 
         row = cur.fetchone()
         if row is None:
-            return False  # Duplicate — already in inventory
+            # Duplicate — content is already stored, but we still need the id.
+            # A no-op DO UPDATE ... RETURNING would avoid this round-trip at the
+            # cost of a heap write on every duplicate; on this workload that is
+            # far more expensive than the extra SELECT.
+            cur.execute(
+                "SELECT internal_id FROM gossip_inventory WHERE gossip_id = %s",
+                (gossip_id,),
+            )
+            existing = cur.fetchone()
+            if existing is None:
+                logger.warning(f"No internal_id for {gossip_id} after conflict; skipping observation")
+                return None
+            return existing[0], False
 
         internal_id = row[0]
 
@@ -88,12 +118,12 @@ class Database:
         if msg_type == 257:
             self._handle_node_announcement(cur, gossip_id, dt, raw_bytes, parsed_obj, internal_id)
         elif msg_type == 256:
-            self._handle_channel_announcement(cur, gossip_id, dt, raw_bytes, parsed_obj)
+            self._handle_channel_announcement(cur, gossip_id, dt, raw_bytes, parsed_obj, internal_id)
         elif msg_type == 258:
-            self._handle_channel_update(cur, gossip_id, dt, raw_bytes, parsed_obj)
+            self._handle_channel_update(cur, gossip_id, dt, raw_bytes, parsed_obj, internal_id)
 
-        return True
-            
+        return internal_id, True
+
     def insert_node_addresses(self, cur, gossip_id, addresses: List[Address]):
         if not addresses: 
             return
@@ -110,7 +140,7 @@ class Database:
                     VALUES (%s, %s, %s, %s)
                 """, (gossip_id, type_id, addr.addr, addr.port))
 
-    def _handle_channel_announcement(self, cur, gossip_id, dt, raw_bytes, data: ChannelAnnouncement):
+    def _handle_channel_announcement(self, cur, gossip_id, dt, raw_bytes, data: ChannelAnnouncement, internal_id: int):
         scid_int = data.scid
         node1 = data.node_id_1.hex()
         node2 = data.node_id_2.hex()
@@ -130,18 +160,18 @@ class Database:
 
          # 2. Insert the Channel
         cur.execute("""
-            INSERT INTO channels 
-            (gossip_id, scid, source_node_id, target_node_id, 
+            INSERT INTO channels
+            (gossip_id, scid, source_node_id, target_node_id,
              node_signature_1, node_signature_2, bitcoin_signature_1, bitcoin_signature_2,
-             features, chain_hash, bitcoin_key_1, bitcoin_key_2, raw_gossip)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             features, chain_hash, bitcoin_key_1, bitcoin_key_2, raw_gossip, internal_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (scid) DO NOTHING
         """, (
             gossip_id, scid_int, node1, node2,
             data.node_signature_1.hex(), data.node_signature_2.hex(),
             data.bitcoin_signature_1.hex(), data.bitcoin_signature_2.hex(),
             data.features, data.chain_hash.hex(),
-            data.bitcoin_key_1.hex(), data.bitcoin_key_2.hex(), raw_bytes
+            data.bitcoin_key_1.hex(), data.bitcoin_key_2.hex(), raw_bytes, internal_id
         ))
 
     def _handle_node_announcement(
@@ -254,7 +284,7 @@ class Database:
         # 5. Addresses — always written, keyed to gossip_id.
         self.insert_node_addresses(cur, gossip_id, data._parse_addresses())
 
-    def _handle_channel_update(self, cur, gossip_id, dt, raw_bytes, data: ChannelUpdate):
+    def _handle_channel_update(self, cur, gossip_id, dt, raw_bytes, data: ChannelUpdate, internal_id: int):
         scid_int = data.scid
         direction = data.direction
         
@@ -291,19 +321,19 @@ class Database:
 
         # 3. Insert
         cur.execute("""
-            INSERT INTO channel_updates 
+            INSERT INTO channel_updates
             (gossip_id, scid, direction, valid_from, valid_to,
              signature, chain_hash, message_flags, channel_flags,
-             cltv_expiry_delta, htlc_minimum_msat, fee_base_msat, 
-             fee_proportional_millionths, htlc_maximum_msat, raw_gossip)
-            VALUES (%s, %s, %s::bit, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             cltv_expiry_delta, htlc_minimum_msat, fee_base_msat,
+             fee_proportional_millionths, htlc_maximum_msat, raw_gossip, internal_id)
+            VALUES (%s, %s, %s::bit, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             gossip_id, scid_int, str(direction), dt, valid_to,
             data.signature.hex(), data.chain_hash.hex(),
             int.from_bytes(data.message_flags, 'big'), int.from_bytes(data.channel_flags, 'big'),
             data.cltv_expiry_delta, data.htlc_minimum_msat,
             data.fee_base_msat, data.fee_proportional_millionths,
-            data.htlc_maximum_msat, raw_bytes
+            data.htlc_maximum_msat, raw_bytes, internal_id
         ))
 
 
@@ -398,9 +428,15 @@ class GossipProcessor:
             receipt_dt = datetime.fromtimestamp(receipt_ts_int, timezone.utc)
             
             gossip_ts_int = receipt_ts_int
+            sender_ts_dt = None
             if hasattr(parsed_obj, 'timestamp'):
                 gossip_ts_int = parsed_obj.timestamp
-            
+                sender_ts_dt = datetime.fromtimestamp(parsed_obj.timestamp, timezone.utc)
+            # sender_timestamp stays NULL when the message carries no timestamp of
+            # its own (channel_announcement, type 256). Falling back to the receipt
+            # time would silently store a "when we saw it" value in a column that
+            # means "when the originator sent it" — seen_at already records that.
+
             # Calculate Lag (How old is this message?)
             now = datetime.now(timezone.utc)
             lag_seconds = (now - receipt_dt).total_seconds()
@@ -411,10 +447,14 @@ class GossipProcessor:
             if msg_type not in [MSG_TYPE_NODE_ANNOUNCEMENT, MSG_TYPE_CHANNEL_ANNOUNCEMENT, MSG_TYPE_CHANNEL_UPDATE]:
                 return
 
-            # DB Operations
-            self.db.register_collector(cur, collector_node_id, receipt_dt)
-            is_new = self.db.insert_content(cur, gossip_id, msg_type, raw_gossip_bytes, parsed_obj, gossip_ts_int)
-            self.db.insert_observation(cur, gossip_id, collector_node_id, receipt_dt)
+            # DB Operations. register_collector must precede insert_observation:
+            # gossip_observations.internal_collector_id has an FK to collectors.
+            internal_collector_id = self.db.register_collector(cur, collector_node_id, receipt_dt)
+            content = self.db.insert_content(cur, gossip_id, msg_type, raw_gossip_bytes, parsed_obj, gossip_ts_int)
+            if content is None:
+                return
+            internal_id, is_new = content
+            self.db.insert_observation(cur, internal_id, internal_collector_id, receipt_dt, sender_ts_dt)
 
             if is_new:
                 self.processed_count += 1
