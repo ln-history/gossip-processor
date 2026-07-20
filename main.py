@@ -49,25 +49,101 @@ class Database:
     def __init__(self, conn_str):
         self.pool = ConnectionPool(conn_str, min_size=4, max_size=20)
         self.pool.wait()
+        # node_id -> internal_collector_id, for collectors known to be COMMITTED.
+        self._collector_ids = {}
+        # node_ids first inserted by the in-flight batch; promoted to the cache
+        # on commit, discarded on rollback (see commit_batch/rollback_batch).
+        self._collector_ids_pending = {}
+        # node_id -> (messages_this_batch, latest_seen_at), flushed per batch.
+        self._collector_stats = {}
         logger.info("--- Connected to PostgreSQL ---")
 
     def register_collector(self, cur, collector_node_id, seen_at_dt) -> int:
-        """UPSERT collector stats and return its internal_collector_id.
+        """Resolve a collector's internal_collector_id, caching it in-process.
 
         gossip_observations.internal_collector_id is NOT NULL with an FK to
-        collectors, so this must run before insert_observation() for any
-        collector we have not seen before. ON CONFLICT DO UPDATE always returns
-        a row (unlike DO NOTHING), so the surrogate id comes back on both paths.
+        collectors, so this must resolve before insert_observation().
+
+        This MUST NOT issue an INSERT per message. internal_collector_id is a
+        smallint identity column, and PostgreSQL evaluates the identity default
+        -- i.e. calls nextval() -- BEFORE it detects an ON CONFLICT collision.
+        An unconditional upsert therefore burns one sequence value per message
+        even though it always conflicts, and exhausts the smallint sequence
+        (max 32767) within minutes. That took ingest down for 23h on
+        2026-07-19. The collector set is tiny and effectively static, so cache
+        it and only touch the table on a genuine miss.
         """
+        cached = self._collector_ids.get(collector_node_id)
+        if cached is None:
+            cached = self._collector_ids_pending.get(collector_node_id)
+        if cached is not None:
+            self._record_collector_activity(collector_node_id, seen_at_dt)
+            return cached
+
+        # Miss: read first. No sequence value is consumed on this path.
+        cur.execute(
+            "SELECT internal_collector_id FROM collectors WHERE node_id = %s",
+            (collector_node_id,),
+        )
+        row = cur.fetchone()
+        if row is not None:
+            self._collector_ids[collector_node_id] = row[0]
+            self._record_collector_activity(collector_node_id, seen_at_dt)
+            return row[0]
+
+        # Genuinely new collector -- the only path allowed to consume a
+        # sequence value. Happens a handful of times in the lifetime of the DB.
+        logger.info(f"Registering new collector {collector_node_id}")
         cur.execute("""
-            INSERT INTO collectors (node_id, last_collection_at, total_messages_collected)
-            VALUES (%s, %s, 1)
+            INSERT INTO collectors (node_id, first_collection_at, last_collection_at)
+            VALUES (%s, %s, %s)
             ON CONFLICT (node_id) DO UPDATE
-            SET last_collection_at = EXCLUDED.last_collection_at,
-                total_messages_collected = collectors.total_messages_collected + 1
+            SET last_collection_at = EXCLUDED.last_collection_at
             RETURNING internal_collector_id
-        """, (collector_node_id, seen_at_dt))
-        return cur.fetchone()[0]
+        """, (collector_node_id, seen_at_dt, seen_at_dt))
+        internal_collector_id = cur.fetchone()[0]
+        # Pending, not cached: this row is invisible to other sessions and
+        # ceases to exist if the batch rolls back. Caching it now would pin an
+        # id that no longer exists and cause FK violations forever after.
+        self._collector_ids_pending[collector_node_id] = internal_collector_id
+        self._record_collector_activity(collector_node_id, seen_at_dt)
+        return internal_collector_id
+
+    def _record_collector_activity(self, collector_node_id, seen_at_dt):
+        count, latest = self._collector_stats.get(collector_node_id, (0, seen_at_dt))
+        self._collector_stats[collector_node_id] = (
+            count + 1,
+            seen_at_dt if seen_at_dt > latest else latest,
+        )
+
+    def flush_collector_stats(self, cur):
+        """Fold this batch's per-collector counters into one UPDATE each.
+
+        Previously this was a per-message UPDATE on a 7-row table, which
+        serialised the whole pipeline on a handful of row locks. Batching it
+        turns ~200 lock acquisitions per transaction into at most one per
+        active collector.
+        """
+        if not self._collector_stats:
+            return
+        for node_id, (count, latest_seen) in self._collector_stats.items():
+            cur.execute("""
+                UPDATE collectors
+                SET total_messages_collected = total_messages_collected + %s,
+                    last_collection_at = GREATEST(last_collection_at, %s)
+                WHERE node_id = %s
+            """, (count, latest_seen, node_id))
+        self._collector_stats.clear()
+
+    def commit_batch(self):
+        """Batch committed: collectors inserted by it are now durable."""
+        self._collector_ids.update(self._collector_ids_pending)
+        self._collector_ids_pending.clear()
+
+    def rollback_batch(self):
+        """Batch rolled back: drop provisional ids and unflushed counters."""
+        self._collector_ids_pending.clear()
+        self._collector_stats.clear()
 
     def insert_observation(self, cur, internal_id, internal_collector_id, seen_at_dt, sender_ts_dt):
         cur.execute("""
@@ -517,6 +593,7 @@ class GossipProcessor:
 
             # 2. Process Batch in Single Transaction
             if batch:
+                done = 0
                 try:
                     with DB_DURATION.time():
                         with self.db.pool.connection() as conn:
@@ -524,9 +601,14 @@ class GossipProcessor:
                                 for msg in batch:
                                     self.process_msg_in_batch(cur, msg)
                                     self.queue.task_done()
+                                    done += 1
+                                self.db.flush_collector_stats(cur)
+                    # The connection context manager commits on clean exit.
+                    self.db.commit_batch()
                 except Exception as e:
                     logger.error(f"Batch Transaction Failed: {e}")
-                    for _ in batch:
+                    self.db.rollback_batch()
+                    for _ in range(len(batch) - done):
                         self.queue.task_done()
 
     def start(self):
