@@ -39,7 +39,7 @@ These tables store the parsed BOLT #7 data **and** the raw binary blob. They use
 | **`node_announcements`** | Stores node metadata and the **raw node announcement blob**. | `gossip_id`, `alias`, `raw_gossip`, `valid_from`, `valid_to` |
 | **`channels`** | Stores static channel definitions and the **raw channel announcement blob**. | `scid`, `source_node_id`, `target_node_id`, `raw_gossip` |
 | **`channel_updates`** | Stores dynamic routing fees and the **raw channel update blob**. | `scid`, `direction`, `fee_base_msat`, `raw_gossip`, `valid_from`, `valid_to` |
-| **`node_addresses`** | Normalized table for IP/Tor addresses linked to announcements. | `gossip_id`, `type_id`, `address`, `port` |
+| **`node_addresses`** | Normalized table for IP/Tor addresses linked to announcements. | `gossip_id`, `internal_id`, `type_id`, `address`, `port` |
 
 ---
 
@@ -109,7 +109,7 @@ sequenceDiagram
     - **SCD Logic**: Find the previous announcement for this `node_id` where `valid_to IS NULL`.
     - Update the previous row: set `valid_to` = `current_timestamp`.
     - Insert the new row into `node_announcements` with `valid_from` = `current_timestamp` and `valid_to` = `NULL`.
-    - Address Normalization: Iterate through the `addresses` (`IPv4`, `Tor`, etc.) and insert them into the `node_addresses` table, linking them to this specific `gossip_id`.
+    - Address Normalization: Iterate through the `addresses` (`IPv4`, `Tor`, etc.) and insert them into the `node_addresses` table, linking them to this specific `gossip_id` **and** its `internal_id` (consumers join on the integer `internal_id`).
 
 3. Channel Update (type: `258`)
 

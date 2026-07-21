@@ -200,21 +200,29 @@ class Database:
 
         return internal_id, True
 
-    def insert_node_addresses(self, cur, gossip_id, addresses: List[Address]):
-        if not addresses: 
+    def insert_node_addresses(self, cur, gossip_id, addresses: List[Address], internal_id: int):
+        """Write the announcement's addresses.
+
+        internal_id is mandatory: since 2026-07-21 the API resolves a node
+        announcement's addresses by joining node_addresses.internal_id against
+        node_announcements_complete.internal_id (an integer join, ~950x cheaper
+        than the unindexed varchar(64) gossip_id join). Rows written with a NULL
+        internal_id are invisible to that join.
+        """
+        if not addresses:
             return
-        
+
         for addr in addresses:
             type_id = None
             if addr.typ:
                 if isinstance(addr.typ, int): type_id = addr.typ
                 elif hasattr(addr.typ, 'id'): type_id = addr.typ.id
-            
+
             if type_id is not None and addr.addr:
                 cur.execute("""
-                    INSERT INTO node_addresses (gossip_id, type_id, address, port)
-                    VALUES (%s, %s, %s, %s)
-                """, (gossip_id, type_id, addr.addr, addr.port))
+                    INSERT INTO node_addresses (gossip_id, type_id, address, port, internal_id)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (gossip_id, type_id, addr.addr, addr.port, internal_id))
 
     def _handle_channel_announcement(self, cur, gossip_id, dt, raw_bytes, data: ChannelAnnouncement, internal_id: int):
         scid_int = data.scid
@@ -313,7 +321,7 @@ class Database:
         if complete_row is None:
             # Conflict — gossip_id already in _complete (shouldn't happen after
             # the inventory check above, but be defensive).
-            self.insert_node_addresses(cur, gossip_id, data._parse_addresses())
+            self.insert_node_addresses(cur, gossip_id, data._parse_addresses(), internal_id)
             return
 
         is_data_update = complete_row[0]
@@ -341,7 +349,7 @@ class Database:
                     na_valid_to = na_tip[0]
                     if dt >= na_valid_to:
                         # Timestamp collision — _complete already written; skip na.
-                        self.insert_node_addresses(cur, gossip_id, data._parse_addresses())
+                        self.insert_node_addresses(cur, gossip_id, data._parse_addresses(), internal_id)
                         return
 
             cur.execute("""
@@ -357,8 +365,8 @@ class Database:
                 True, internal_id,
             ))
 
-        # 5. Addresses — always written, keyed to gossip_id.
-        self.insert_node_addresses(cur, gossip_id, data._parse_addresses())
+        # 5. Addresses — always written, keyed to gossip_id and internal_id.
+        self.insert_node_addresses(cur, gossip_id, data._parse_addresses(), internal_id)
 
     def _handle_channel_update(self, cur, gossip_id, dt, raw_bytes, data: ChannelUpdate, internal_id: int):
         scid_int = data.scid
